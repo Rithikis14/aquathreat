@@ -1,0 +1,310 @@
+# prepare_dataset.py
+"""
+AquaThreat — Dataset Preparation Pipeline
+
+This script does the FULL dataset preparation in one run:
+
+  Step 1: Read your 5,000 real annotated images + their YOLO label files
+  Step 2: Run the GAN generator over every image → 5,000 enhanced copies
+  Step 3: Copy the SAME label files for the enhanced images
+          (bounding boxes don't move — only pixel colours change)
+  Step 4: Merge real + GAN images into one folder
+  Step 5: Auto-split into train / val / test  (70% / 15% / 15%)
+  Step 6: Write the final dataset.yaml
+
+Final output structure:
+    data/
+    ├── images/
+    │   ├── train/   (~7,000 images — mix of real + GAN)
+    │   ├── val/     (~1,500 images)
+    │   └── test/    (~1,500 images)
+    ├── labels/
+    │   ├── train/
+    │   ├── val/
+    │   └── test/
+    └── dataset.yaml
+
+Usage:
+    # Minimal — point to your raw images + labels folder
+    python prepare_dataset.py \
+        --images-dir  raw_data/images \
+        --labels-dir  raw_data/labels \
+        --out-dir     data
+
+    # With trained GAN weights (recommended once GAN is trained)
+    python prepare_dataset.py \
+        --images-dir  raw_data/images \
+        --labels-dir  raw_data/labels \
+        --gan-weights runs/gan/generator_epoch_100.pt \
+        --out-dir     data
+
+    # Skip GAN (just split your real images, no enhancement)
+    python prepare_dataset.py \
+        --images-dir  raw_data/images \
+        --labels-dir  raw_data/labels \
+        --no-gan \
+        --out-dir     data
+"""
+
+import argparse
+import random
+import shutil
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+from tqdm import tqdm
+
+# Import the generator from our existing GAN script
+sys.path.insert(0, str(Path(__file__).parent))
+from underwater_gan_enhance import UNetGenerator, run_generator
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def find_image_label_pairs(images_dir: Path, labels_dir: Path) -> list[tuple[Path, Path]]:
+    """
+    Find all (image, label) pairs where both files exist.
+    Image:  images_dir/frame_001.jpg
+    Label:  labels_dir/frame_001.txt   ← same stem, .txt extension
+    """
+    pairs = []
+    missing_labels = []
+
+    for img_path in sorted(images_dir.iterdir()):
+        if img_path.suffix.lower() not in IMAGE_EXTS:
+            continue
+        lbl_path = labels_dir / (img_path.stem + ".txt")
+        if lbl_path.exists():
+            pairs.append((img_path, lbl_path))
+        else:
+            missing_labels.append(img_path.name)
+
+    if missing_labels:
+        print(f"[Warn] {len(missing_labels)} images have no matching label file — skipped.")
+        if len(missing_labels) <= 5:
+            for f in missing_labels:
+                print(f"       missing: {f}")
+
+    print(f"[Pairs] Found {len(pairs)} valid image+label pairs.")
+    return pairs
+
+
+def load_generator(weights_path: str | None, size: int) -> UNetGenerator | None:
+    """Load the GAN generator. Returns None if no weights or GAN disabled."""
+    gen = UNetGenerator(in_channels=3, out_channels=3, base_features=64)
+
+    if weights_path and Path(weights_path).exists():
+        gen.load_state_dict(torch.load(weights_path, map_location="cpu"))
+        print(f"[GAN] Loaded trained weights: {weights_path}")
+    else:
+        if weights_path:
+            print(f"[GAN] Weights file not found: {weights_path}")
+            print(f"[GAN] Using UNTRAINED generator (output will be noisy).")
+            print(f"      Train first: python train_gan.py --auto-degrade --epochs 100")
+        else:
+            print("[GAN] No weights provided — using untrained generator.")
+            print("      For real results train first: python train_gan.py --auto-degrade")
+
+    gen.eval()
+    return gen
+
+
+def enhance_image(generator: UNetGenerator, img_bgr: np.ndarray, size: int) -> np.ndarray:
+    """Run GAN on a BGR image, return enhanced BGR image at original resolution."""
+    rgb     = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    enh_rgb = run_generator(generator, rgb, size=size)
+    return cv2.cvtColor(enh_rgb, cv2.COLOR_RGB2BGR)
+
+
+def split_indices(n: int, train_ratio=0.70, val_ratio=0.15, seed=42):
+    """Return (train_idx, val_idx, test_idx) lists."""
+    indices = list(range(n))
+    random.seed(seed)
+    random.shuffle(indices)
+
+    n_train = int(n * train_ratio)
+    n_val   = int(n * val_ratio)
+
+    return (
+        indices[:n_train],
+        indices[n_train:n_train + n_val],
+        indices[n_train + n_val:],
+    )
+
+
+def copy_pair(img_src: Path, lbl_src: Path,
+              img_dst: Path, lbl_dst: Path):
+    """Copy image + label to destination paths."""
+    shutil.copy2(img_src, img_dst)
+    shutil.copy2(lbl_src, lbl_dst)
+
+
+def write_dataset_yaml(out_dir: Path, nc: int = 4):
+    yaml_content = f"""# AquaThreat Dataset — auto-generated by prepare_dataset.py
+path: {out_dir.resolve()}
+train: images/train
+val:   images/val
+test:  images/test
+
+nc: {nc}
+names:
+  0: bottom_mine
+  1: moored_mine
+  2: drifting_mine
+  3: artillery_uxo
+"""
+    yaml_path = out_dir / "dataset.yaml"
+    yaml_path.write_text(yaml_content)
+    print(f"[YAML] dataset.yaml written → {yaml_path}")
+    return yaml_path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  MAIN PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def prepare(args):
+    images_dir = Path(args.images_dir)
+    labels_dir = Path(args.labels_dir)
+    out_dir    = Path(args.out_dir)
+
+    assert images_dir.exists(), f"Images directory not found: {images_dir}"
+    assert labels_dir.exists(), f"Labels directory not found: {labels_dir}"
+
+    # ── Create output folder structure ────────────────────────────────────────
+    for split in ["train", "val", "test"]:
+        (out_dir / "images" / split).mkdir(parents=True, exist_ok=True)
+        (out_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+    # ── Find all valid pairs ──────────────────────────────────────────────────
+    pairs = find_image_label_pairs(images_dir, labels_dir)
+    if not pairs:
+        print("[Error] No valid image+label pairs found. Check your folder paths.")
+        sys.exit(1)
+
+    # ── Load GAN generator ────────────────────────────────────────────────────
+    generator = None
+    if not args.no_gan:
+        generator = load_generator(args.gan_weights, args.gan_size)
+
+    # ── Split indices (applied to REAL images) ────────────────────────────────
+    train_idx, val_idx, test_idx = split_indices(
+        len(pairs), train_ratio=0.70, val_ratio=0.15
+    )
+
+    split_map = {}
+    for i in train_idx: split_map[i] = "train"
+    for i in val_idx:   split_map[i] = "val"
+    for i in test_idx:  split_map[i] = "test"
+
+    print(f"\n[Split] Total pairs : {len(pairs)}")
+    print(f"        Train        : {len(train_idx)}")
+    print(f"        Val          : {len(val_idx)}")
+    print(f"        Test         : {len(test_idx)}")
+
+    real_counts = {"train": 0, "val": 0, "test": 0}
+    gan_counts  = {"train": 0, "val": 0, "test": 0}
+
+    # ── Copy REAL images + labels ─────────────────────────────────────────────
+    print(f"\n[Step 1/2] Copying real images...")
+    for i, (img_path, lbl_path) in enumerate(tqdm(pairs, desc="Real images")):
+        split  = split_map[i]
+        suffix = img_path.suffix.lower()
+
+        img_dst = out_dir / "images" / split / f"real_{img_path.stem}{suffix}"
+        lbl_dst = out_dir / "labels" / split / f"real_{img_path.stem}.txt"
+        copy_pair(img_path, lbl_path, img_dst, lbl_dst)
+        real_counts[split] += 1
+
+    # ── Generate and save GAN-enhanced images (same split as their real pair) ──
+    if generator is not None:
+        print(f"\n[Step 2/2] Generating GAN-enhanced images...")
+        print(f"           GAN images go into the SAME split as their real counterpart")
+        print(f"           so the val/test sets contain both real and enhanced versions.\n")
+
+        for i, (img_path, lbl_path) in enumerate(tqdm(pairs, desc="GAN enhance")):
+            split  = split_map[i]
+            suffix = img_path.suffix.lower()
+
+            # Load image
+            bgr = cv2.imread(str(img_path))
+            if bgr is None:
+                continue
+
+            # Enhance
+            enh_bgr = enhance_image(generator, bgr, size=args.gan_size)
+
+            # Save enhanced image
+            img_dst = out_dir / "images" / split / f"gan_{img_path.stem}{suffix}"
+            cv2.imwrite(str(img_dst), enh_bgr)
+
+            # Copy THE SAME label file — bboxes don't change with colour correction
+            lbl_dst = out_dir / "labels" / split / f"gan_{img_path.stem}.txt"
+            shutil.copy2(lbl_path, lbl_dst)
+
+            gan_counts[split] += 1
+
+    # ── Write dataset.yaml ────────────────────────────────────────────────────
+    yaml_path = write_dataset_yaml(out_dir)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    total_train = real_counts["train"] + gan_counts["train"]
+    total_val   = real_counts["val"]   + gan_counts["val"]
+    total_test  = real_counts["test"]  + gan_counts["test"]
+    grand_total = total_train + total_val + total_test
+
+    print(f"""
+{'='*55}
+  DATASET PREPARATION COMPLETE
+{'='*55}
+  Split      Real     GAN    Total
+  ─────────────────────────────────
+  train      {real_counts['train']:<6}   {gan_counts['train']:<6} {total_train}
+  val        {real_counts['val']:<6}   {gan_counts['val']:<6} {total_val}
+  test       {real_counts['test']:<6}   {gan_counts['test']:<6} {total_test}
+  ─────────────────────────────────
+  TOTAL      {sum(real_counts.values()):<6}   {sum(gan_counts.values()):<6} {grand_total}
+{'='*55}
+
+  dataset.yaml → {yaml_path}
+
+  Next step — train YOLO:
+  python train.py --data {yaml_path} --epochs 100 --batch 16
+""")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ARGS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Prepare AquaThreat dataset")
+    p.add_argument("--images-dir",  required=True,
+                   help="Folder containing your raw annotated images")
+    p.add_argument("--labels-dir",  required=True,
+                   help="Folder containing matching YOLO .txt label files")
+    p.add_argument("--out-dir",     default="data",
+                   help="Output root (default: data/)")
+    p.add_argument("--gan-weights", default=None,
+                   help="Path to trained generator .pt file "
+                        "(omit to use untrained — output will be noisy)")
+    p.add_argument("--gan-size",    type=int, default=256,
+                   help="Internal GAN resolution (default 256)")
+    p.add_argument("--no-gan",      action="store_true",
+                   help="Skip GAN enhancement — just split real images only")
+    p.add_argument("--seed",        type=int, default=42,
+                   help="Random seed for train/val/test split")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    prepare(args)

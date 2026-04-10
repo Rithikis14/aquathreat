@@ -1,0 +1,59 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environment ───────────────────────────────────────────────────────
+venv/
+env/
+.env/
+.venv/
+
+# ── Model weights ─────────────────────────────────────────────────────────────
+# Exclude all .pt files — too large for Git (use Git LFS or share separately)
+*.pt
+*.pth
+*.onnx
+*.torchscript
+
+# ── Training runs & outputs ───────────────────────────────────────────────────
+runs/
+
+# ── Dataset images & labels ───────────────────────────────────────────────────
+# Exclude raw data and prepared dataset — share via Roboflow or Google Drive
+data/images/
+data/labels/
+data/gan/
+raw_data/
+
+# ── GAN sample outputs ────────────────────────────────────────────────────────
+samples_epoch_*.png
+loss_curves.png
+*_comparison.png
+*_side_by_side.png
+*_enhanced.png
+
+# ── Ultralytics cache ─────────────────────────────────────────────────────────
+*.cache
+
+# ── W&B (Weights & Biases) ────────────────────────────────────────────────────
+wandb/
+
+# ── VS Code ───────────────────────────────────────────────────────────────────
+.vscode/
+
+# ── Windows ───────────────────────────────────────────────────────────────────
+Thumbs.db
+desktop.ini
+*.lnk
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+.DS_Store
+*.log
+*.tmp
