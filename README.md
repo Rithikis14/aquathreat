@@ -32,7 +32,12 @@ AquaThreat/
 └── train.py                 # Main training script
 ````
 
------
+---
+
+## 📊 Detection Results
+![Detection Results](./result/val_batch0_pred.jpg)
+
+---
 
 ## 🛠️ Installation & Setup
 
