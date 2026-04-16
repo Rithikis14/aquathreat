@@ -115,6 +115,3 @@ python detect.py --source path/to/underwater_video.mp4 --weights models/best.pt
 -----
 
 **Developed by [Rithik V Kumar](https://www.google.com/search?q=https://github.com/Rithikis14)** *Aspiring AI & Software Development Engineer*
-
-```
-```
